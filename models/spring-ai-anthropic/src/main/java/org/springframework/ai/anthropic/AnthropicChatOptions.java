@@ -32,7 +32,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 
 import org.springframework.ai.anthropic.api.AnthropicApi;
 import org.springframework.ai.anthropic.api.AnthropicApi.ChatCompletionRequest;
-import org.springframework.ai.model.function.FunctionCallback;
+import org.springframework.ai.anthropic.api.AnthropicCacheStrategy;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.lang.Nullable;
@@ -44,6 +44,8 @@ import org.springframework.util.Assert;
  * @author Christian Tzolov
  * @author Thomas Vitale
  * @author Alexandros Pappas
+ * @author Ilayaperumal Gopinathan
+ * @author Soby Chacko
  * @since 1.0.0
  */
 @JsonInclude(Include.NON_NULL)
@@ -57,13 +59,43 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 	private @JsonProperty("temperature") Double temperature;
 	private @JsonProperty("top_p") Double topP;
 	private @JsonProperty("top_k") Integer topK;
+	private @JsonProperty("thinking") ChatCompletionRequest.ThinkingConfig thinking;
+
+	/**
+	 * The caching strategy to use. Defines which parts of the prompt should be cached.
+	 */
+	@JsonIgnore
+	private AnthropicCacheStrategy cacheStrategy = AnthropicCacheStrategy.NONE;
+
+	/**
+	 * Cache time-to-live. Either "5m" (5 minutes, default) or "1h" (1 hour).
+	 * The 1-hour cache requires a beta header.
+	 */
+	@JsonIgnore
+	private String cacheTtl = "5m";
+
+	public AnthropicCacheStrategy getCacheStrategy() {
+		return this.cacheStrategy;
+	}
+
+	public void setCacheStrategy(AnthropicCacheStrategy cacheStrategy) {
+		this.cacheStrategy = cacheStrategy;
+	}
+
+	public String getCacheTtl() {
+		return this.cacheTtl;
+	}
+
+	public void setCacheTtl(String cacheTtl) {
+		this.cacheTtl = cacheTtl;
+	}
 
 	/**
 	 * Collection of {@link ToolCallback}s to be used for tool calling in the chat
 	 * completion requests.
 	 */
 	@JsonIgnore
-	private List<FunctionCallback> toolCallbacks = new ArrayList<>();
+	private List<ToolCallback> toolCallbacks = new ArrayList<>();
 
 	/**
 	 * Collection of tool names to be resolved at runtime and used for tool calling in the
@@ -103,12 +135,15 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 			.temperature(fromOptions.getTemperature())
 			.topP(fromOptions.getTopP())
 			.topK(fromOptions.getTopK())
+			.thinking(fromOptions.getThinking())
 			.toolCallbacks(
 					fromOptions.getToolCallbacks() != null ? new ArrayList<>(fromOptions.getToolCallbacks()) : null)
 			.toolNames(fromOptions.getToolNames() != null ? new HashSet<>(fromOptions.getToolNames()) : null)
-			.internalToolExecutionEnabled(fromOptions.isInternalToolExecutionEnabled())
+			.internalToolExecutionEnabled(fromOptions.getInternalToolExecutionEnabled())
 			.toolContext(fromOptions.getToolContext() != null ? new HashMap<>(fromOptions.getToolContext()) : null)
 			.httpHeaders(fromOptions.getHttpHeaders() != null ? new HashMap<>(fromOptions.getHttpHeaders()) : null)
+			.cacheStrategy(fromOptions.getCacheStrategy())
+			.cacheTtl(fromOptions.getCacheTtl())
 			.build();
 	}
 
@@ -174,15 +209,23 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 		this.topK = topK;
 	}
 
+	public ChatCompletionRequest.ThinkingConfig getThinking() {
+		return this.thinking;
+	}
+
+	public void setThinking(ChatCompletionRequest.ThinkingConfig thinking) {
+		this.thinking = thinking;
+	}
+
 	@Override
 	@JsonIgnore
-	public List<FunctionCallback> getToolCallbacks() {
+	public List<ToolCallback> getToolCallbacks() {
 		return this.toolCallbacks;
 	}
 
 	@Override
 	@JsonIgnore
-	public void setToolCallbacks(List<FunctionCallback> toolCallbacks) {
+	public void setToolCallbacks(List<ToolCallback> toolCallbacks) {
 		Assert.notNull(toolCallbacks, "toolCallbacks cannot be null");
 		Assert.noNullElements(toolCallbacks, "toolCallbacks cannot contain null elements");
 		this.toolCallbacks = toolCallbacks;
@@ -206,42 +249,14 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 	@Override
 	@Nullable
 	@JsonIgnore
-	public Boolean isInternalToolExecutionEnabled() {
-		return internalToolExecutionEnabled;
+	public Boolean getInternalToolExecutionEnabled() {
+		return this.internalToolExecutionEnabled;
 	}
 
 	@Override
 	@JsonIgnore
 	public void setInternalToolExecutionEnabled(@Nullable Boolean internalToolExecutionEnabled) {
 		this.internalToolExecutionEnabled = internalToolExecutionEnabled;
-	}
-
-	@Override
-	@Deprecated
-	@JsonIgnore
-	public List<FunctionCallback> getFunctionCallbacks() {
-		return this.getToolCallbacks();
-	}
-
-	@Override
-	@Deprecated
-	@JsonIgnore
-	public void setFunctionCallbacks(List<FunctionCallback> functionCallbacks) {
-		this.setToolCallbacks(functionCallbacks);
-	}
-
-	@Override
-	@Deprecated
-	@JsonIgnore
-	public Set<String> getFunctions() {
-		return this.getToolNames();
-	}
-
-	@Override
-	@Deprecated
-	@JsonIgnore
-	public void setFunctions(Set<String> functionNames) {
-		this.setToolNames(functionNames);
 	}
 
 	@Override
@@ -254,19 +269,6 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 	@JsonIgnore
 	public Double getPresencePenalty() {
 		return null;
-	}
-
-	@Override
-	@Deprecated
-	@JsonIgnore
-	public Boolean getProxyToolCalls() {
-		return this.internalToolExecutionEnabled != null ? !this.internalToolExecutionEnabled : null;
-	}
-
-	@Deprecated
-	@JsonIgnore
-	public void setProxyToolCalls(Boolean proxyToolCalls) {
-		this.internalToolExecutionEnabled = proxyToolCalls != null ? !proxyToolCalls : null;
 	}
 
 	@Override
@@ -283,7 +285,7 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 
 	@JsonIgnore
 	public Map<String, String> getHttpHeaders() {
-		return httpHeaders;
+		return this.httpHeaders;
 	}
 
 	public void setHttpHeaders(Map<String, String> httpHeaders) {
@@ -308,17 +310,21 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 				&& Objects.equals(this.metadata, that.metadata)
 				&& Objects.equals(this.stopSequences, that.stopSequences)
 				&& Objects.equals(this.temperature, that.temperature) && Objects.equals(this.topP, that.topP)
-				&& Objects.equals(this.topK, that.topK) && Objects.equals(this.toolCallbacks, that.toolCallbacks)
+				&& Objects.equals(this.topK, that.topK) && Objects.equals(this.thinking, that.thinking)
+				&& Objects.equals(this.toolCallbacks, that.toolCallbacks)
 				&& Objects.equals(this.toolNames, that.toolNames)
 				&& Objects.equals(this.internalToolExecutionEnabled, that.internalToolExecutionEnabled)
 				&& Objects.equals(this.toolContext, that.toolContext)
-				&& Objects.equals(this.httpHeaders, that.httpHeaders);
+				&& Objects.equals(this.httpHeaders, that.httpHeaders)
+				&& Objects.equals(this.cacheStrategy, that.cacheStrategy)
+				&& Objects.equals(this.cacheTtl, that.cacheTtl);
 	}
 
 	@Override
 	public int hashCode() {
-		return Objects.hash(model, maxTokens, metadata, stopSequences, temperature, topP, topK, toolCallbacks,
-				toolNames, internalToolExecutionEnabled, toolContext, httpHeaders);
+		return Objects.hash(this.model, this.maxTokens, this.metadata, this.stopSequences, this.temperature, this.topP,
+				this.topK, this.thinking, this.toolCallbacks, this.toolNames, this.internalToolExecutionEnabled,
+				this.toolContext, this.httpHeaders, this.cacheStrategy, this.cacheTtl);
 	}
 
 	public static class Builder {
@@ -365,12 +371,22 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 			return this;
 		}
 
-		public Builder toolCallbacks(List<FunctionCallback> toolCallbacks) {
+		public Builder thinking(ChatCompletionRequest.ThinkingConfig thinking) {
+			this.options.thinking = thinking;
+			return this;
+		}
+
+		public Builder thinking(AnthropicApi.ThinkingType type, Integer budgetTokens) {
+			this.options.thinking = new ChatCompletionRequest.ThinkingConfig(type, budgetTokens);
+			return this;
+		}
+
+		public Builder toolCallbacks(List<ToolCallback> toolCallbacks) {
 			this.options.setToolCallbacks(toolCallbacks);
 			return this;
 		}
 
-		public Builder toolCallbacks(FunctionCallback... toolCallbacks) {
+		public Builder toolCallbacks(ToolCallback... toolCallbacks) {
 			Assert.notNull(toolCallbacks, "toolCallbacks cannot be null");
 			this.options.toolCallbacks.addAll(Arrays.asList(toolCallbacks));
 			return this;
@@ -393,29 +409,6 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 			return this;
 		}
 
-		@Deprecated
-		public Builder functionCallbacks(List<FunctionCallback> functionCallbacks) {
-			return toolCallbacks(functionCallbacks);
-		}
-
-		@Deprecated
-		public Builder functions(Set<String> functionNames) {
-			return toolNames(functionNames);
-		}
-
-		@Deprecated
-		public Builder function(String functionName) {
-			return toolNames(functionName);
-		}
-
-		@Deprecated
-		public Builder proxyToolCalls(Boolean proxyToolCalls) {
-			if (proxyToolCalls != null) {
-				this.options.setInternalToolExecutionEnabled(!proxyToolCalls);
-			}
-			return this;
-		}
-
 		public Builder toolContext(Map<String, Object> toolContext) {
 			if (this.options.toolContext == null) {
 				this.options.toolContext = toolContext;
@@ -428,6 +421,22 @@ public class AnthropicChatOptions implements ToolCallingChatOptions {
 
 		public Builder httpHeaders(Map<String, String> httpHeaders) {
 			this.options.setHttpHeaders(httpHeaders);
+			return this;
+		}
+
+		/**
+		 * Set the caching strategy to use.
+		 */
+		public Builder cacheStrategy(AnthropicCacheStrategy cacheStrategy) {
+			this.options.cacheStrategy = cacheStrategy;
+			return this;
+		}
+
+		/**
+		 * Set the cache time-to-live. Either "5m" (5 minutes, default) or "1h" (1 hour).
+		 */
+		public Builder cacheTtl(String cacheTtl) {
+			this.options.cacheTtl = cacheTtl;
 			return this;
 		}
 

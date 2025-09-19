@@ -42,7 +42,9 @@ import org.springframework.ai.anthropic.api.AnthropicApi.ContentBlock;
 import org.springframework.ai.anthropic.api.AnthropicApi.ContentBlock.Source;
 import org.springframework.ai.anthropic.api.AnthropicApi.ContentBlock.Type;
 import org.springframework.ai.anthropic.api.AnthropicApi.Role;
+import org.springframework.ai.anthropic.api.AnthropicCacheStrategy;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
@@ -51,7 +53,6 @@ import org.springframework.ai.chat.metadata.ChatResponseMetadata;
 import org.springframework.ai.chat.metadata.DefaultUsage;
 import org.springframework.ai.chat.metadata.EmptyUsage;
 import org.springframework.ai.chat.metadata.Usage;
-import org.springframework.ai.chat.metadata.UsageUtils;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
@@ -62,12 +63,16 @@ import org.springframework.ai.chat.observation.ChatModelObservationDocumentation
 import org.springframework.ai.chat.observation.DefaultChatModelObservationConvention;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
-import org.springframework.ai.model.Media;
+import org.springframework.ai.content.Media;
 import org.springframework.ai.model.ModelOptionsUtils;
+import org.springframework.ai.model.tool.DefaultToolExecutionEligibilityPredicate;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.model.tool.ToolCallingManager;
+import org.springframework.ai.model.tool.ToolExecutionEligibilityPredicate;
 import org.springframework.ai.model.tool.ToolExecutionResult;
+import org.springframework.ai.model.tool.internal.ToolCallReactiveContextHolder;
 import org.springframework.ai.retry.RetryUtils;
+import org.springframework.ai.support.UsageCalculator;
 import org.springframework.ai.tool.definition.ToolDefinition;
 import org.springframework.ai.util.json.JsonParser;
 import org.springframework.http.ResponseEntity;
@@ -86,6 +91,8 @@ import org.springframework.util.StringUtils;
  * @author Thomas Vitale
  * @author Claudio Silva Junior
  * @author Alexandros Pappas
+ * @author Jonghoon Park
+ * @author Soby Chacko
  * @since 1.0.0
  */
 public class AnthropicChatModel implements ChatModel {
@@ -125,6 +132,12 @@ public class AnthropicChatModel implements ChatModel {
 	private final ToolCallingManager toolCallingManager;
 
 	/**
+	 * The tool execution eligibility predicate used to determine if a tool can be
+	 * executed.
+	 */
+	private final ToolExecutionEligibilityPredicate toolExecutionEligibilityPredicate;
+
+	/**
 	 * Conventions to use for generating observations.
 	 */
 	private ChatModelObservationConvention observationConvention = DEFAULT_OBSERVATION_CONVENTION;
@@ -132,18 +145,27 @@ public class AnthropicChatModel implements ChatModel {
 	public AnthropicChatModel(AnthropicApi anthropicApi, AnthropicChatOptions defaultOptions,
 			ToolCallingManager toolCallingManager, RetryTemplate retryTemplate,
 			ObservationRegistry observationRegistry) {
+		this(anthropicApi, defaultOptions, toolCallingManager, retryTemplate, observationRegistry,
+				new DefaultToolExecutionEligibilityPredicate());
+	}
+
+	public AnthropicChatModel(AnthropicApi anthropicApi, AnthropicChatOptions defaultOptions,
+			ToolCallingManager toolCallingManager, RetryTemplate retryTemplate, ObservationRegistry observationRegistry,
+			ToolExecutionEligibilityPredicate toolExecutionEligibilityPredicate) {
 
 		Assert.notNull(anthropicApi, "anthropicApi cannot be null");
 		Assert.notNull(defaultOptions, "defaultOptions cannot be null");
 		Assert.notNull(toolCallingManager, "toolCallingManager cannot be null");
 		Assert.notNull(retryTemplate, "retryTemplate cannot be null");
 		Assert.notNull(observationRegistry, "observationRegistry cannot be null");
+		Assert.notNull(toolExecutionEligibilityPredicate, "toolExecutionEligibilityPredicate cannot be null");
 
 		this.anthropicApi = anthropicApi;
 		this.defaultOptions = defaultOptions;
 		this.toolCallingManager = toolCallingManager;
 		this.retryTemplate = retryTemplate;
 		this.observationRegistry = observationRegistry;
+		this.toolExecutionEligibilityPredicate = toolExecutionEligibilityPredicate;
 	}
 
 	@Override
@@ -160,7 +182,6 @@ public class AnthropicChatModel implements ChatModel {
 		ChatModelObservationContext observationContext = ChatModelObservationContext.builder()
 			.prompt(prompt)
 			.provider(AnthropicApi.PROVIDER_NAME)
-			.requestOptions(prompt.getOptions())
 			.build();
 
 		ChatResponse response = ChatModelObservationDocumentation.CHAT_MODEL_OPERATION
@@ -176,7 +197,8 @@ public class AnthropicChatModel implements ChatModel {
 
 				Usage currentChatResponseUsage = usage != null ? this.getDefaultUsage(completionResponse.usage())
 						: new EmptyUsage();
-				Usage accumulatedUsage = UsageUtils.getCumulativeUsage(currentChatResponseUsage, previousChatResponse);
+				Usage accumulatedUsage = UsageCalculator.getCumulativeUsage(currentChatResponseUsage,
+						previousChatResponse);
 
 				ChatResponse chatResponse = toChatResponse(completionEntity.getBody(), accumulatedUsage);
 				observationContext.setResponse(chatResponse);
@@ -184,8 +206,7 @@ public class AnthropicChatModel implements ChatModel {
 				return chatResponse;
 			});
 
-		if (ToolCallingChatOptions.isInternalToolExecutionEnabled(prompt.getOptions()) && response != null
-				&& response.hasToolCalls()) {
+		if (this.toolExecutionEligibilityPredicate.isToolExecutionRequired(prompt.getOptions(), response)) {
 			var toolExecutionResult = this.toolCallingManager.executeToolCalls(prompt, response);
 			if (toolExecutionResult.returnDirect()) {
 				// Return tool execution result directly to the client.
@@ -224,7 +245,6 @@ public class AnthropicChatModel implements ChatModel {
 			ChatModelObservationContext observationContext = ChatModelObservationContext.builder()
 				.prompt(prompt)
 				.provider(AnthropicApi.PROVIDER_NAME)
-				.requestOptions(prompt.getOptions())
 				.build();
 
 			Observation observation = ChatModelObservationDocumentation.CHAT_MODEL_OPERATION.observation(
@@ -237,31 +257,48 @@ public class AnthropicChatModel implements ChatModel {
 					this.getAdditionalHttpHeaders(prompt));
 
 			// @formatter:off
-			Flux<ChatResponse> chatResponseFlux = response.switchMap(chatCompletionResponse -> {
+			Flux<ChatResponse> chatResponseFlux = response.flatMap(chatCompletionResponse -> {
 				AnthropicApi.Usage usage = chatCompletionResponse.usage();
 				Usage currentChatResponseUsage = usage != null ? this.getDefaultUsage(chatCompletionResponse.usage()) : new EmptyUsage();
-				Usage accumulatedUsage = UsageUtils.getCumulativeUsage(currentChatResponseUsage, previousChatResponse);
+				Usage accumulatedUsage = UsageCalculator.getCumulativeUsage(currentChatResponseUsage, previousChatResponse);
 				ChatResponse chatResponse = toChatResponse(chatCompletionResponse, accumulatedUsage);
 
-				if (ToolCallingChatOptions.isInternalToolExecutionEnabled(prompt.getOptions()) && chatResponse.hasToolCalls() && chatResponse.hasFinishReasons(Set.of("tool_use"))) {
-					// FIXME: bounded elastic needs to be used since tool calling
-					//  is currently only synchronous
-					return Flux.defer(() -> {
-						var toolExecutionResult = this.toolCallingManager.executeToolCalls(prompt, chatResponse);
-						if (toolExecutionResult.returnDirect()) {
-							// Return tool execution result directly to the client.
-							return Flux.just(ChatResponse.builder().from(chatResponse)
-								.generations(ToolExecutionResult.buildGenerations(toolExecutionResult))
-								.build());
-						} else {
-							// Send the tool execution result back to the model.
-							return this.internalStream(new Prompt(toolExecutionResult.conversationHistory(), prompt.getOptions()),
-									chatResponse);
-						}
-					}).subscribeOn(Schedulers.boundedElastic());
-				}
+				if (this.toolExecutionEligibilityPredicate.isToolExecutionRequired(prompt.getOptions(), chatResponse)) {
 
-				return Mono.just(chatResponse);
+					if (chatResponse.hasFinishReasons(Set.of("tool_use"))) {
+						// FIXME: bounded elastic needs to be used since tool calling
+						//  is currently only synchronous
+						return Flux.deferContextual(ctx -> {
+							// TODO: factor out the tool execution logic with setting context into a utility.
+							ToolExecutionResult toolExecutionResult;
+							try {
+								ToolCallReactiveContextHolder.setContext(ctx);
+								toolExecutionResult = this.toolCallingManager.executeToolCalls(prompt, chatResponse);
+							}
+							finally {
+								ToolCallReactiveContextHolder.clearContext();
+							}
+							if (toolExecutionResult.returnDirect()) {
+								// Return tool execution result directly to the client.
+								return Flux.just(ChatResponse.builder().from(chatResponse)
+									.generations(ToolExecutionResult.buildGenerations(toolExecutionResult))
+									.build());
+							}
+							else {
+								// Send the tool execution result back to the model.
+								return this.internalStream(new Prompt(toolExecutionResult.conversationHistory(), prompt.getOptions()),
+										chatResponse);
+							}
+						}).subscribeOn(Schedulers.boundedElastic());
+					}
+					else {
+						return Mono.empty();
+					}
+				}
+				else {
+					// If internal tool execution is not required, just return the chat response.
+					return Mono.just(chatResponse);
+				}
 			})
 			.doOnError(observation::error)
 			.doFinally(s -> observation.stop())
@@ -279,46 +316,58 @@ public class AnthropicChatModel implements ChatModel {
 			return new ChatResponse(List.of());
 		}
 
-		List<Generation> generations = chatCompletion.content()
-			.stream()
-			.filter(content -> content.type() != ContentBlock.Type.TOOL_USE)
-			.map(content -> new Generation(new AssistantMessage(content.text(), Map.of()),
-					ChatGenerationMetadata.builder().finishReason(chatCompletion.stopReason()).build()))
-			.toList();
-
-		List<Generation> allGenerations = new ArrayList<>(generations);
+		List<Generation> generations = new ArrayList<>();
+		List<AssistantMessage.ToolCall> toolCalls = new ArrayList<>();
+		for (ContentBlock content : chatCompletion.content()) {
+			switch (content.type()) {
+				case TEXT, TEXT_DELTA:
+					generations.add(new Generation(
+							AssistantMessage.builder().content(content.text()).properties(Map.of()).build(),
+							ChatGenerationMetadata.builder().finishReason(chatCompletion.stopReason()).build()));
+					break;
+				case THINKING, THINKING_DELTA:
+					Map<String, Object> thinkingProperties = new HashMap<>();
+					thinkingProperties.put("signature", content.signature());
+					generations.add(new Generation(
+							AssistantMessage.builder()
+								.content(content.thinking())
+								.properties(thinkingProperties)
+								.build(),
+							ChatGenerationMetadata.builder().finishReason(chatCompletion.stopReason()).build()));
+					break;
+				case REDACTED_THINKING:
+					Map<String, Object> redactedProperties = new HashMap<>();
+					redactedProperties.put("data", content.data());
+					generations.add(new Generation(AssistantMessage.builder().properties(redactedProperties).build(),
+							ChatGenerationMetadata.builder().finishReason(chatCompletion.stopReason()).build()));
+					break;
+				case TOOL_USE:
+					var functionCallId = content.id();
+					var functionName = content.name();
+					var functionArguments = JsonParser.toJson(content.input());
+					toolCalls.add(
+							new AssistantMessage.ToolCall(functionCallId, "function", functionName, functionArguments));
+					break;
+			}
+		}
 
 		if (chatCompletion.stopReason() != null && generations.isEmpty()) {
-			Generation generation = new Generation(new AssistantMessage(null, Map.of()),
+			Generation generation = new Generation(AssistantMessage.builder().content("").properties(Map.of()).build(),
 					ChatGenerationMetadata.builder().finishReason(chatCompletion.stopReason()).build());
-			allGenerations.add(generation);
+			generations.add(generation);
 		}
 
-		List<ContentBlock> toolToUseList = chatCompletion.content()
-			.stream()
-			.filter(c -> c.type() == ContentBlock.Type.TOOL_USE)
-			.toList();
-
-		if (!CollectionUtils.isEmpty(toolToUseList)) {
-			List<AssistantMessage.ToolCall> toolCalls = new ArrayList<>();
-
-			for (ContentBlock toolToUse : toolToUseList) {
-
-				var functionCallId = toolToUse.id();
-				var functionName = toolToUse.name();
-				var functionArguments = JsonParser.toJson(toolToUse.input());
-
-				toolCalls
-					.add(new AssistantMessage.ToolCall(functionCallId, "function", functionName, functionArguments));
-			}
-
-			AssistantMessage assistantMessage = new AssistantMessage("", Map.of(), toolCalls);
+		if (!CollectionUtils.isEmpty(toolCalls)) {
+			AssistantMessage assistantMessage = AssistantMessage.builder()
+				.content("")
+				.properties(Map.of())
+				.toolCalls(toolCalls)
+				.build();
 			Generation toolCallGeneration = new Generation(assistantMessage,
 					ChatGenerationMetadata.builder().finishReason(chatCompletion.stopReason()).build());
-			allGenerations.add(toolCallGeneration);
+			generations.add(toolCallGeneration);
 		}
-
-		return new ChatResponse(allGenerations, this.from(chatCompletion, usage));
+		return new ChatResponse(generations, this.from(chatCompletion, usage));
 	}
 
 	private ChatResponseMetadata from(AnthropicApi.ChatCompletionResponse result) {
@@ -335,6 +384,18 @@ public class AnthropicChatModel implements ChatModel {
 			.keyValue("stop-sequence", result.stopSequence())
 			.keyValue("type", result.type())
 			.build();
+	}
+
+	private Source getSourceByMedia(Media media) {
+		String data = this.fromMediaData(media.getData());
+
+		// http is not allowed and redirect not allowed
+		if (data.startsWith("https://")) {
+			return new Source(data);
+		}
+		else {
+			return new Source(media.getMimeType().toString(), data);
+		}
 	}
 
 	private String fromMediaData(Object mediaData) {
@@ -393,21 +454,33 @@ public class AnthropicChatModel implements ChatModel {
 		// Merge @JsonIgnore-annotated options explicitly since they are ignored by
 		// Jackson, used by ModelOptionsUtils.
 		if (runtimeOptions != null) {
+			if (runtimeOptions.getFrequencyPenalty() != null) {
+				logger.warn("The frequencyPenalty option is not supported by Anthropic API. Ignoring.");
+			}
+			if (runtimeOptions.getPresencePenalty() != null) {
+				logger.warn("The presencePenalty option is not supported by Anthropic API. Ignoring.");
+			}
 			requestOptions.setHttpHeaders(
 					mergeHttpHeaders(runtimeOptions.getHttpHeaders(), this.defaultOptions.getHttpHeaders()));
 			requestOptions.setInternalToolExecutionEnabled(
-					ModelOptionsUtils.mergeOption(runtimeOptions.isInternalToolExecutionEnabled(),
-							this.defaultOptions.isInternalToolExecutionEnabled()));
+					ModelOptionsUtils.mergeOption(runtimeOptions.getInternalToolExecutionEnabled(),
+							this.defaultOptions.getInternalToolExecutionEnabled()));
 			requestOptions.setToolNames(ToolCallingChatOptions.mergeToolNames(runtimeOptions.getToolNames(),
 					this.defaultOptions.getToolNames()));
 			requestOptions.setToolCallbacks(ToolCallingChatOptions.mergeToolCallbacks(runtimeOptions.getToolCallbacks(),
 					this.defaultOptions.getToolCallbacks()));
 			requestOptions.setToolContext(ToolCallingChatOptions.mergeToolContext(runtimeOptions.getToolContext(),
 					this.defaultOptions.getToolContext()));
+
+			// Merge cache strategy and TTL (also @JsonIgnore fields)
+			requestOptions.setCacheStrategy(runtimeOptions.getCacheStrategy() != null
+					? runtimeOptions.getCacheStrategy() : this.defaultOptions.getCacheStrategy());
+			requestOptions.setCacheTtl(runtimeOptions.getCacheTtl() != null ? runtimeOptions.getCacheTtl()
+					: this.defaultOptions.getCacheTtl());
 		}
 		else {
 			requestOptions.setHttpHeaders(this.defaultOptions.getHttpHeaders());
-			requestOptions.setInternalToolExecutionEnabled(this.defaultOptions.isInternalToolExecutionEnabled());
+			requestOptions.setInternalToolExecutionEnabled(this.defaultOptions.getInternalToolExecutionEnabled());
 			requestOptions.setToolNames(this.defaultOptions.getToolNames());
 			requestOptions.setToolCallbacks(this.defaultOptions.getToolCallbacks());
 			requestOptions.setToolContext(this.defaultOptions.getToolContext());
@@ -427,70 +500,75 @@ public class AnthropicChatModel implements ChatModel {
 
 	ChatCompletionRequest createRequest(Prompt prompt, boolean stream) {
 
-		List<AnthropicMessage> userMessages = prompt.getInstructions()
-			.stream()
-			.filter(message -> message.getMessageType() != MessageType.SYSTEM)
-			.map(message -> {
-				if (message.getMessageType() == MessageType.USER) {
-					List<ContentBlock> contents = new ArrayList<>(List.of(new ContentBlock(message.getText())));
-					if (message instanceof UserMessage userMessage) {
-						if (!CollectionUtils.isEmpty(userMessage.getMedia())) {
-							List<ContentBlock> mediaContent = userMessage.getMedia().stream().map(media -> {
-								Type contentBlockType = getContentBlockTypeByMedia(media);
-								var source = new Source(media.getMimeType().toString(),
-										this.fromMediaData(media.getData()));
-								return new ContentBlock(contentBlockType, source);
-							}).toList();
-							contents.addAll(mediaContent);
-						}
-					}
-					return new AnthropicMessage(contents, Role.valueOf(message.getMessageType().name()));
-				}
-				else if (message.getMessageType() == MessageType.ASSISTANT) {
-					AssistantMessage assistantMessage = (AssistantMessage) message;
-					List<ContentBlock> contentBlocks = new ArrayList<>();
-					if (StringUtils.hasText(message.getText())) {
-						contentBlocks.add(new ContentBlock(message.getText()));
-					}
-					if (!CollectionUtils.isEmpty(assistantMessage.getToolCalls())) {
-						for (AssistantMessage.ToolCall toolCall : assistantMessage.getToolCalls()) {
-							contentBlocks.add(new ContentBlock(Type.TOOL_USE, toolCall.id(), toolCall.name(),
-									ModelOptionsUtils.jsonToMap(toolCall.arguments())));
-						}
-					}
-					return new AnthropicMessage(contentBlocks, Role.ASSISTANT);
-				}
-				else if (message.getMessageType() == MessageType.TOOL) {
-					List<ContentBlock> toolResponses = ((ToolResponseMessage) message).getResponses()
-						.stream()
-						.map(toolResponse -> new ContentBlock(Type.TOOL_RESULT, toolResponse.id(),
-								toolResponse.responseData()))
-						.toList();
-					return new AnthropicMessage(toolResponses, Role.USER);
-				}
-				else {
-					throw new IllegalArgumentException("Unsupported message type: " + message.getMessageType());
-				}
-			})
-			.toList();
+		// Get caching strategy and options from the request
+		logger.debug("DEBUGINFO: prompt.getOptions() type: {}, value: {}",
+				prompt.getOptions() != null ? prompt.getOptions().getClass().getName() : "null", prompt.getOptions());
 
-		String systemPrompt = prompt.getInstructions()
-			.stream()
-			.filter(m -> m.getMessageType() == MessageType.SYSTEM)
-			.map(m -> m.getText())
-			.collect(Collectors.joining(System.lineSeparator()));
+		AnthropicChatOptions requestOptions = null;
+		if (prompt.getOptions() instanceof AnthropicChatOptions) {
+			requestOptions = (AnthropicChatOptions) prompt.getOptions();
+			logger.debug("DEBUGINFO: Found AnthropicChatOptions - cacheStrategy: {}, cacheTtl: {}",
+					requestOptions.getCacheStrategy(), requestOptions.getCacheTtl());
+		}
+		else {
+			logger.debug("DEBUGINFO: Options is NOT AnthropicChatOptions, it's: {}",
+					prompt.getOptions() != null ? prompt.getOptions().getClass().getName() : "null");
+		}
 
+		AnthropicCacheStrategy strategy = requestOptions != null ? requestOptions.getCacheStrategy()
+				: AnthropicCacheStrategy.NONE;
+		String cacheTtl = requestOptions != null ? requestOptions.getCacheTtl() : "5m";
+
+		logger.debug("Cache strategy: {}, TTL: {}", strategy, cacheTtl);
+
+		// Track how many breakpoints we've used (max 4)
+		CacheBreakpointTracker breakpointsUsed = new CacheBreakpointTracker();
+		ChatCompletionRequest.CacheControl cacheControl = null;
+
+		if (strategy != AnthropicCacheStrategy.NONE) {
+			// Create cache control with TTL if specified, otherwise use default 5m
+			if (cacheTtl != null && !cacheTtl.equals("5m")) {
+				cacheControl = new ChatCompletionRequest.CacheControl("ephemeral", cacheTtl);
+				logger.debug("Created cache control with TTL: type={}, ttl={}", "ephemeral", cacheTtl);
+			}
+			else {
+				cacheControl = new ChatCompletionRequest.CacheControl("ephemeral");
+				logger.debug("Created cache control with default TTL: type={}, ttl={}", "ephemeral", "5m");
+			}
+		}
+
+		// Build messages WITHOUT blanket cache control - strategic placement only
+		List<AnthropicMessage> userMessages = buildMessages(prompt, strategy, cacheControl, breakpointsUsed);
+
+		// Process system - as array if caching, string otherwise
+		Object systemContent = buildSystemContent(prompt, strategy, cacheControl, breakpointsUsed);
+
+		// Build base request
 		ChatCompletionRequest request = new ChatCompletionRequest(this.defaultOptions.getModel(), userMessages,
-				systemPrompt, this.defaultOptions.getMaxTokens(), this.defaultOptions.getTemperature(), stream);
+				systemContent, this.defaultOptions.getMaxTokens(), this.defaultOptions.getTemperature(), stream);
 
-		AnthropicChatOptions requestOptions = (AnthropicChatOptions) prompt.getOptions();
 		request = ModelOptionsUtils.merge(requestOptions, request, ChatCompletionRequest.class);
 
-		// Add the tool definitions to the request's tools parameter.
+		// Add the tool definitions with potential caching
 		List<ToolDefinition> toolDefinitions = this.toolCallingManager.resolveToolDefinitions(requestOptions);
 		if (!CollectionUtils.isEmpty(toolDefinitions)) {
 			request = ModelOptionsUtils.merge(request, this.defaultOptions, ChatCompletionRequest.class);
-			request = ChatCompletionRequest.from(request).withTools(getFunctionTools(toolDefinitions)).build();
+			List<AnthropicApi.Tool> tools = getFunctionTools(toolDefinitions);
+
+			// Apply caching to tools if strategy includes them
+			if ((strategy == AnthropicCacheStrategy.SYSTEM_AND_TOOLS
+					|| strategy == AnthropicCacheStrategy.CONVERSATION_HISTORY) && breakpointsUsed.canUse()) {
+				tools = addCacheToLastTool(tools, cacheControl, breakpointsUsed);
+			}
+
+			request = ChatCompletionRequest.from(request).tools(tools).build();
+		}
+
+		// Add beta header for 1-hour TTL if needed
+		if ("1h".equals(cacheTtl) && requestOptions != null) {
+			Map<String, String> headers = new HashMap<>(requestOptions.getHttpHeaders());
+			headers.put("anthropic-beta", AnthropicApi.BETA_EXTENDED_CACHE_TTL);
+			requestOptions.setHttpHeaders(headers);
 		}
 
 		return request;
@@ -504,6 +582,154 @@ public class AnthropicChatModel implements ChatModel {
 			return new AnthropicApi.Tool(name, description, JsonParser.fromJson(inputSchema, new TypeReference<>() {
 			}));
 		}).toList();
+	}
+
+	/**
+	 * Build messages strategically, applying cache control only where specified by the
+	 * strategy.
+	 */
+	private List<AnthropicMessage> buildMessages(Prompt prompt, AnthropicCacheStrategy strategy,
+			ChatCompletionRequest.CacheControl cacheControl, CacheBreakpointTracker breakpointsUsed) {
+
+		List<Message> allMessages = prompt.getInstructions()
+			.stream()
+			.filter(message -> message.getMessageType() != MessageType.SYSTEM)
+			.toList();
+
+		// Find the last user message (current question) for CONVERSATION_HISTORY strategy
+		int lastUserIndex = -1;
+		if (strategy == AnthropicCacheStrategy.CONVERSATION_HISTORY) {
+			for (int i = allMessages.size() - 1; i >= 0; i--) {
+				if (allMessages.get(i).getMessageType() == MessageType.USER) {
+					lastUserIndex = i;
+					break;
+				}
+			}
+		}
+
+		List<AnthropicMessage> result = new ArrayList<>();
+		for (int i = 0; i < allMessages.size(); i++) {
+			Message message = allMessages.get(i);
+			boolean shouldApplyCache = false;
+
+			// Apply cache to history tail (message before current question) for
+			// CONVERSATION_HISTORY
+			if (strategy == AnthropicCacheStrategy.CONVERSATION_HISTORY && breakpointsUsed.canUse()) {
+				if (lastUserIndex > 0) {
+					// Cache the message immediately before the last user message
+					// (multi-turn conversation)
+					shouldApplyCache = (i == lastUserIndex - 1);
+				}
+				if (shouldApplyCache) {
+					breakpointsUsed.use();
+				}
+			}
+
+			if (message.getMessageType() == MessageType.USER) {
+				List<ContentBlock> contents = new ArrayList<>();
+
+				// Apply cache control strategically, not to all user messages
+				if (shouldApplyCache && cacheControl != null) {
+					contents.add(new ContentBlock(message.getText(), cacheControl));
+				}
+				else {
+					contents.add(new ContentBlock(message.getText()));
+				}
+
+				if (message instanceof UserMessage userMessage) {
+					if (!CollectionUtils.isEmpty(userMessage.getMedia())) {
+						List<ContentBlock> mediaContent = userMessage.getMedia().stream().map(media -> {
+							Type contentBlockType = getContentBlockTypeByMedia(media);
+							var source = getSourceByMedia(media);
+							return new ContentBlock(contentBlockType, source);
+						}).toList();
+						contents.addAll(mediaContent);
+					}
+				}
+				result.add(new AnthropicMessage(contents, Role.valueOf(message.getMessageType().name())));
+			}
+			else if (message.getMessageType() == MessageType.ASSISTANT) {
+				AssistantMessage assistantMessage = (AssistantMessage) message;
+				List<ContentBlock> contentBlocks = new ArrayList<>();
+				if (StringUtils.hasText(message.getText())) {
+					contentBlocks.add(new ContentBlock(message.getText()));
+				}
+				if (!CollectionUtils.isEmpty(assistantMessage.getToolCalls())) {
+					for (AssistantMessage.ToolCall toolCall : assistantMessage.getToolCalls()) {
+						contentBlocks.add(new ContentBlock(Type.TOOL_USE, toolCall.id(), toolCall.name(),
+								ModelOptionsUtils.jsonToMap(toolCall.arguments())));
+					}
+				}
+				result.add(new AnthropicMessage(contentBlocks, Role.ASSISTANT));
+			}
+			else if (message.getMessageType() == MessageType.TOOL) {
+				List<ContentBlock> toolResponses = ((ToolResponseMessage) message).getResponses()
+					.stream()
+					.map(toolResponse -> new ContentBlock(Type.TOOL_RESULT, toolResponse.id(),
+							toolResponse.responseData()))
+					.toList();
+				result.add(new AnthropicMessage(toolResponses, Role.USER));
+			}
+			else {
+				throw new IllegalArgumentException("Unsupported message type: " + message.getMessageType());
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * Build system content - as array if caching, string otherwise.
+	 */
+	private Object buildSystemContent(Prompt prompt, AnthropicCacheStrategy strategy,
+			ChatCompletionRequest.CacheControl cacheControl, CacheBreakpointTracker breakpointsUsed) {
+
+		String systemText = prompt.getInstructions()
+			.stream()
+			.filter(m -> m.getMessageType() == MessageType.SYSTEM)
+			.map(Message::getText)
+			.collect(Collectors.joining(System.lineSeparator()));
+
+		if (!StringUtils.hasText(systemText)) {
+			return null;
+		}
+
+		// Use array format when caching system
+		if ((strategy == AnthropicCacheStrategy.SYSTEM_ONLY || strategy == AnthropicCacheStrategy.SYSTEM_AND_TOOLS
+				|| strategy == AnthropicCacheStrategy.CONVERSATION_HISTORY) && breakpointsUsed.canUse()
+				&& cacheControl != null) {
+
+			logger.debug("Applying cache control to system message - strategy: {}, cacheControl: {}", strategy,
+					cacheControl);
+			List<ContentBlock> systemBlocks = List.of(new ContentBlock(systemText, cacheControl));
+			breakpointsUsed.use();
+			return systemBlocks;
+		}
+
+		// Use string format when not caching (backward compatible)
+		return systemText;
+	}
+
+	/**
+	 * Add cache control to the last tool for deterministic caching.
+	 */
+	private List<AnthropicApi.Tool> addCacheToLastTool(List<AnthropicApi.Tool> tools,
+			ChatCompletionRequest.CacheControl cacheControl, CacheBreakpointTracker breakpointsUsed) {
+
+		if (tools == null || tools.isEmpty() || !breakpointsUsed.canUse() || cacheControl == null) {
+			return tools;
+		}
+
+		List<AnthropicApi.Tool> modifiedTools = new ArrayList<>();
+		for (int i = 0; i < tools.size(); i++) {
+			AnthropicApi.Tool tool = tools.get(i);
+			if (i == tools.size() - 1) {
+				// Add cache control to last tool
+				tool = new AnthropicApi.Tool(tool.name(), tool.description(), tool.inputSchema(), cacheControl);
+				breakpointsUsed.use();
+			}
+			modifiedTools.add(tool);
+		}
+		return modifiedTools;
 	}
 
 	@Override
@@ -540,6 +766,8 @@ public class AnthropicChatModel implements ChatModel {
 
 		private ObservationRegistry observationRegistry = ObservationRegistry.NOOP;
 
+		private ToolExecutionEligibilityPredicate toolExecutionEligibilityPredicate = new DefaultToolExecutionEligibilityPredicate();
+
 		private Builder() {
 		}
 
@@ -563,18 +791,56 @@ public class AnthropicChatModel implements ChatModel {
 			return this;
 		}
 
+		public Builder toolExecutionEligibilityPredicate(
+				ToolExecutionEligibilityPredicate toolExecutionEligibilityPredicate) {
+			this.toolExecutionEligibilityPredicate = toolExecutionEligibilityPredicate;
+			return this;
+		}
+
 		public Builder observationRegistry(ObservationRegistry observationRegistry) {
 			this.observationRegistry = observationRegistry;
 			return this;
 		}
 
 		public AnthropicChatModel build() {
-			if (toolCallingManager != null) {
-				return new AnthropicChatModel(anthropicApi, defaultOptions, toolCallingManager, retryTemplate,
-						observationRegistry);
+			if (this.toolCallingManager != null) {
+				return new AnthropicChatModel(this.anthropicApi, this.defaultOptions, this.toolCallingManager,
+						this.retryTemplate, this.observationRegistry, this.toolExecutionEligibilityPredicate);
 			}
-			return new AnthropicChatModel(anthropicApi, defaultOptions, DEFAULT_TOOL_CALLING_MANAGER, retryTemplate,
-					observationRegistry);
+			return new AnthropicChatModel(this.anthropicApi, this.defaultOptions, DEFAULT_TOOL_CALLING_MANAGER,
+					this.retryTemplate, this.observationRegistry, this.toolExecutionEligibilityPredicate);
+		}
+
+	}
+
+	/**
+	 * Tracks cache breakpoints used (max 4 allowed by Anthropic). Non-static to ensure
+	 * each request has its own instance.
+	 */
+	private class CacheBreakpointTracker {
+
+		private int count = 0;
+
+		private boolean hasWarned = false;
+
+		public boolean canUse() {
+			return this.count < 4;
+		}
+
+		public void use() {
+			if (this.count < 4) {
+				this.count++;
+			}
+			else if (!this.hasWarned) {
+				logger.warn(
+						"Anthropic cache breakpoint limit (4) reached. Additional cache_control directives will be ignored. "
+								+ "Consider using fewer cache strategies or simpler content structure.");
+				this.hasWarned = true;
+			}
+		}
+
+		public int getCount() {
+			return this.count;
 		}
 
 	}
